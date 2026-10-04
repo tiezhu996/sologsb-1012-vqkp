@@ -1,0 +1,7 @@
+node_modules/
+dist/
+www/
+.stencil/
+coverage/
+*.log
+.DS_Store

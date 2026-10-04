@@ -15,6 +15,27 @@ import {
   type LessonStep,
   type ValidationCheck,
 } from '../../models';
+import {
+  abortMerge,
+  canCompleteMerge,
+  completeMerge,
+  createOfflinePackage,
+  diffLines,
+  driveMerge,
+  FIELD_LABELS,
+  formatFieldValue,
+  MERGE_SESSION_STORAGE_KEY,
+  parseOfflinePackage,
+  resolveConflict,
+  retryFailedModule,
+  skipFailedModule,
+  startMergeSession,
+  type ConflictChoice,
+  type DiffSegment,
+  type MergeConflict,
+  type MergeSession,
+  type OfflineCoursePackage,
+} from '../../merge/course-merge';
 
 type PreviewSize = 'phone' | 'tablet';
 
@@ -31,9 +52,13 @@ export class AppRoot {
   @State() playProgress = 0;
   @State() offline = typeof navigator !== 'undefined' ? !navigator.onLine : false;
   @State() toast?: { color: string; message: string };
+  @State() mergeSession?: MergeSession;
+  @State() mergeDriving = false;
+  @State() mergePanelOpen = false;
   private past: CourseProject[] = [];
   private future: CourseProject[] = [];
   private playTimer?: number;
+  private fileInput?: HTMLInputElement;
 
   componentWillLoad(): void {
     try {
@@ -41,6 +66,18 @@ export class AppRoot {
       if (saved) this.project = JSON.parse(saved) as CourseProject;
     } catch {
       this.project = createDemoProject();
+    }
+    try {
+      const savedSession = localStorage.getItem(MERGE_SESSION_STORAGE_KEY);
+      if (savedSession) {
+        const session = JSON.parse(savedSession) as MergeSession;
+        if (session.status !== 'aborted') {
+          this.mergeSession = session;
+          this.mergePanelOpen = true;
+        } else localStorage.removeItem(MERGE_SESSION_STORAGE_KEY);
+      }
+    } catch {
+      localStorage.removeItem(MERGE_SESSION_STORAGE_KEY);
     }
   }
 
@@ -106,6 +143,10 @@ export class AppRoot {
       this.showToast('warning', '当前版本已冻结，请先创建修订版。');
       return;
     }
+    if (this.mergeSession) {
+      this.showToast('warning', '离线包合并进行中，请先完成或放弃合并，再继续编辑。');
+      return;
+    }
     const before = cloneProject(this.project);
     const next = update(cloneProject(this.project));
     next.revision = before.revision + 1;
@@ -118,6 +159,7 @@ export class AppRoot {
   }
 
   private undo(): void {
+    if (this.mergeSession) return this.showToast('warning', '合并进行中暂不能撤销，请先完成或放弃合并。');
     const previous = this.past.pop();
     if (!previous) return this.showToast('medium', '没有可撤销的修改。');
     this.future = [cloneProject(this.project), ...this.future].slice(0, 80);
@@ -126,6 +168,7 @@ export class AppRoot {
   }
 
   private redo(): void {
+    if (this.mergeSession) return this.showToast('warning', '合并进行中暂不能重做，请先完成或放弃合并。');
     const next = this.future.shift();
     if (!next) return;
     this.past = [...this.past, cloneProject(this.project)].slice(-80);
@@ -265,12 +308,20 @@ export class AppRoot {
       this.showToast('warning', '冻结版本不可覆盖，请先创建修订版。');
       return;
     }
+    if (this.mergeSession) {
+      this.showToast('warning', '离线包合并进行中，请先完成或放弃合并。');
+      return;
+    }
     this.project = { ...this.project, status: 'draft', lastSavedAt: new Date().toISOString() };
     this.persist();
     if (showMessage) this.showToast('success', '草稿已保存在浏览器本地。');
   }
 
   private submitForReview(): void {
+    if (this.mergeSession && this.mergeBlocked) {
+      this.showToast('danger', '离线包合并还有待选冲突，选完并并入后才能提交复核。');
+      return;
+    }
     const blocking = this.checks.filter((check) => check.severity === 'error');
     if (blocking.length) {
       this.activePanel = 'checks';
@@ -306,6 +357,390 @@ export class AppRoot {
 
   private reviseFrozen(): void {
     this.commit((draft) => ({ ...draft, status: 'draft' }), '已创建修订版，可继续编辑。');
+  }
+
+  /* ---------------- 离线课程包合并 ---------------- */
+
+  private get mergeConflicts(): MergeConflict[] {
+    return this.mergeSession?.conflicts.filter((conflict) => !conflict.resolved) ?? [];
+  }
+
+  private get mergeProgress(): { done: number; total: number } {
+    const session = this.mergeSession;
+    if (!session) return { done: 0, total: 0 };
+    return { done: session.cursor, total: session.worklist.length };
+  }
+
+  private get mergeBlocked(): boolean {
+    if (!this.mergeSession) return false;
+    const session = this.mergeSession;
+    if (session.status === 'interrupted') return true;
+    return session.cursor < session.worklist.length || this.mergeConflicts.length > 0;
+  }
+
+  private persistMergeSession(session?: MergeSession): void {
+    // 已完成并入或主动放弃才清除；ready/中断/待选状态都保留，刷新可继续
+    if (session && session.status !== 'aborted') {
+      localStorage.setItem(MERGE_SESSION_STORAGE_KEY, JSON.stringify(session));
+    } else {
+      localStorage.removeItem(MERGE_SESSION_STORAGE_KEY);
+    }
+  }
+
+  private exportOfflinePackage(): void {
+    const pkg = createOfflinePackage(this.project);
+    const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    const stamp = new Date().toISOString().slice(0, 10);
+    anchor.href = url;
+    anchor.download = `signcourse-offline-${stamp}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    this.showToast('success', '已导出离线课程包，可拷到平板离线编辑字幕、步骤与前置条件。');
+  }
+
+  private triggerImport(): void {
+    if (this.project.status === 'frozen') {
+      this.showToast('warning', '当前版本已冻结，请先创建修订版再并入离线改动。');
+      return;
+    }
+    if (this.mergeSession) {
+      this.showToast('warning', '已有进行中的合并，请先完成、解决冲突或放弃后再导入。');
+      return;
+    }
+    this.fileInput?.click();
+  }
+
+  private async handlePackageSelected(event: Event): Promise<void> {
+    const input = event.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const pkg = parseOfflinePackage(text) as OfflineCoursePackage;
+      const session = startMergeSession(this.project, pkg, { fileName: file.name });
+      this.mergeSession = session;
+      this.mergePanelOpen = true;
+      this.persistMergeSession(session);
+      this.mergeDriving = true;
+      const driven = await driveMerge(session, (checkpoint) => {
+        this.mergeSession = checkpoint;
+        this.persistMergeSession(checkpoint);
+      });
+      this.mergeSession = driven;
+      this.persistMergeSession(driven);
+      this.mergeDriving = false;
+      if (driven.status === 'interrupted') {
+        this.showToast('danger', `合并在模块「${driven.failedAt?.moduleId}」处中断，已保留进度，可重试或跳过。`);
+      } else if (this.mergeConflicts.length > 0) {
+        this.showToast('warning', `有 ${this.mergeConflicts.length} 处两边都改过的差异，请逐处选择后再生效。`);
+      } else {
+        this.showToast('success', '离线包处理完成，没有待选冲突，确认后并入工作稿。');
+      }
+    } catch (error) {
+      this.mergeDriving = false;
+      this.showToast('danger', error instanceof Error ? error.message : '离线包导入失败。');
+    }
+  }
+
+  private async continueMerge(action: 'retry' | 'skip'): Promise<void> {
+    if (!this.mergeSession) return;
+    let session = this.mergeSession;
+    if (action === 'retry') session = retryFailedModule(session);
+    else session = skipFailedModule(session);
+    this.mergeSession = session;
+    this.persistMergeSession(session);
+    if (session.status === 'processing') {
+      this.mergeDriving = true;
+      session = await driveMerge(session, (checkpoint) => {
+        this.mergeSession = checkpoint;
+        this.persistMergeSession(checkpoint);
+      });
+      this.mergeSession = session;
+      this.persistMergeSession(session);
+      this.mergeDriving = false;
+    }
+    if (session.status === 'interrupted') {
+      this.showToast('danger', `该模块仍然无法处理：${session.failedAt?.message ?? ''}`);
+    } else if (this.mergeConflicts.length > 0) {
+      this.showToast('warning', `还有 ${this.mergeConflicts.length} 处冲突待选择。`);
+    } else {
+      this.showToast('success', '模块已处理完，可确认并入工作稿。');
+    }
+  }
+
+  private chooseConflict(conflictId: string, choice: ConflictChoice): void {
+    if (!this.mergeSession) return;
+    const session = resolveConflict(this.mergeSession, conflictId, choice);
+    this.mergeSession = session;
+    this.persistMergeSession(session);
+    if (this.mergeConflicts.length === 0 && session.status === 'ready') {
+      this.showToast('success', '所有冲突已选择，确认后改动才会并入工作稿。');
+    }
+  }
+
+  private confirmMerge(): void {
+    const session = this.mergeSession;
+    if (!session) return;
+    if (!canCompleteMerge(session)) {
+      this.showToast('danger', '仍有冲突未选择或模块未处理完，不能并入。');
+      return;
+    }
+    const before = cloneProject(this.project);
+    const merged = completeMerge(session);
+    this.past = [...this.past, before].slice(-80);
+    this.future = [];
+    this.project = merged;
+    this.persist();
+    this.mergeSession = undefined;
+    this.mergePanelOpen = false;
+    this.persistMergeSession(undefined);
+    this.showToast('success', '离线改动已并入工作稿，可用撤销回退整次合并。');
+  }
+
+  private cancelMerge(): void {
+    const session = this.mergeSession;
+    if (!session) return;
+    this.mergeSession = abortMerge(session);
+    this.persistMergeSession(undefined);
+    this.mergeSession = undefined;
+    this.mergePanelOpen = false;
+    this.showToast('medium', '已放弃本次合并，工作稿保持原样。');
+  }
+
+  private findStepTitle(moduleId: string, stepId?: string): string {
+    if (!stepId) return '';
+    const module = this.mergeSession?.provisionalModules.find((item) => item.id === moduleId)
+      ?? this.project.modules.find((item) => item.id === moduleId);
+    return module?.steps.find((step) => step.id === stepId)?.title ?? stepId;
+  }
+
+  private renderDiffValue(baseValue: unknown, value: unknown, field?: string) {
+    const resolveStepTitle = (id: string) => {
+      if (!this.mergeSession) return undefined;
+      for (const module of this.mergeSession.provisionalModules) {
+        const step = module.steps.find((item) => item.id === id);
+        if (step) return step.title;
+      }
+      return undefined;
+    };
+    const text = field ? formatFieldValue(field, value, resolveStepTitle) : String(value ?? '');
+    const baseText = field ? formatFieldValue(field, baseValue, resolveStepTitle) : String(baseValue ?? '');
+    const multiline = field === 'commonMistakes' || text.includes('\n') || baseText.includes('\n');
+    if (!multiline) {
+      return <div class={`merge-value ${text ? '' : 'empty'}`}>{text || '（空）'}</div>;
+    }
+    const segments: DiffSegment[] = diffLines(baseText, text);
+    return (
+      <div class="merge-value multiline">
+        {segments.map((segment, index) => (
+          <span key={index} class={`diff-line diff-${segment.type}`}>{segment.type === 'add' ? '+ ' : segment.type === 'remove' ? '- ' : ''}{segment.text || ' '}</span>
+        ))}
+      </div>
+    );
+  }
+
+  private renderOrderConflict(conflict: MergeConflict) {
+    const localOrder = (conflict.kind === 'step-order' ? conflict.localValue : []) as string[];
+    const incomingOrder = (conflict.kind === 'step-order' ? conflict.incomingValue : []) as string[];
+    const renderList = (ids: string[]) => (
+      <ol class="merge-order-list">
+        {ids.map((id, index) => <li><span class="order-index">{index + 1}</span>{this.findStepTitle(conflict.moduleId, id)}</li>)}
+      </ol>
+    );
+    return (
+      <div class="merge-order-columns">
+        <div>
+          <span class="merge-side-tag local">电脑顺序</span>
+          {renderList(localOrder)}
+        </div>
+        <div>
+          <span class="merge-side-tag incoming">平板顺序</span>
+          {renderList(incomingOrder)}
+        </div>
+      </div>
+    );
+  }
+
+  private renderDeleteConflict(conflict: MergeConflict) {
+    const stepDeleted = conflict.kind === 'step-delete';
+    const deletedOn = conflict.deletedBy === 'local' ? '电脑稿' : '平板稿';
+    const editedOn = conflict.deletedBy === 'local' ? '平板' : '电脑';
+    const survivor = conflict.deletedBy === 'local' ? conflict.incomingValue : conflict.localValue;
+    return (
+      <div class="merge-delete-body">
+        <p>{stepDeleted ? '步骤' : '整个模块'}在<strong>{deletedOn}</strong>中已删除，但{editedOn}侧还改过内容。删除后引用该{stepDeleted ? '步骤' : '模块'}的前置条件会一并处理。</p>
+        {stepDeleted && survivor && (
+          <div class="merge-survivor">
+            <strong>{(survivor as LessonStep).title}</strong>
+            <small>{(survivor as LessonStep).kind} · {(survivor as LessonStep).duration}s · 字幕：{(survivor as LessonStep).caption}</small>
+          </div>
+        )}
+        {!stepDeleted && survivor && (
+          <div class="merge-survivor">
+            <strong>{(survivor as CourseModule).title}</strong>
+            <small>{(survivor as CourseModule).steps.length} 个学习步骤 · {(survivor as CourseModule).summary}</small>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  private renderFieldConflict(conflict: MergeConflict) {
+    return (
+      <div class="merge-diff-columns">
+        <div>
+          <span class="merge-side-tag local">电脑工作稿</span>
+          {this.renderDiffValue(conflict.baseValue, conflict.localValue, conflict.field)}
+        </div>
+        <div>
+          <span class="merge-side-tag incoming">平板离线包</span>
+          {this.renderDiffValue(conflict.baseValue, conflict.incomingValue, conflict.field)}
+        </div>
+      </div>
+    );
+  }
+
+  private renderConflictItem(conflict: MergeConflict) {
+    const resolved = conflict.resolved;
+    const choiceLabel = conflict.choice === 'local'
+      ? '已采用电脑稿'
+      : conflict.choice === 'incoming'
+        ? '已采用平板稿'
+        : conflict.choice === 'keep'
+          ? '已保留'
+          : conflict.choice === 'delete'
+            ? '已删除'
+            : '';
+    const kindLabel = conflict.kind === 'field'
+      ? (conflict.field ? FIELD_LABELS[conflict.field] : '字段')
+      : conflict.kind === 'step-order'
+        ? '步骤顺序'
+        : conflict.kind === 'step-delete'
+          ? '删除/修改冲突'
+          : '模块删除冲突';
+    return (
+      <article class={`merge-conflict ${resolved ? 'resolved' : ''}`}>
+        <header>
+          <div><span class="conflict-kind">{kindLabel}</span><strong>{conflict.location}</strong></div>
+          {resolved && <span class="resolved-tag">{choiceLabel}</span>}
+        </header>
+        {conflict.kind === 'field' && this.renderFieldConflict(conflict)}
+        {conflict.kind === 'step-order' && this.renderOrderConflict(conflict)}
+        {(conflict.kind === 'step-delete' || conflict.kind === 'module-delete') && this.renderDeleteConflict(conflict)}
+        {!resolved && (
+          <footer>
+            {conflict.kind === 'field' && [
+              <ion-button size="small" color="primary" class="studio-button" onClick={() => this.chooseConflict(conflict.id, 'local')}>采用电脑稿</ion-button>,
+              <ion-button size="small" color="tertiary" class="studio-button" onClick={() => this.chooseConflict(conflict.id, 'incoming')}>采用平板稿</ion-button>,
+            ]}
+            {conflict.kind === 'step-order' && [
+              <ion-button size="small" color="primary" class="studio-button" onClick={() => this.chooseConflict(conflict.id, 'local')}>按电脑顺序</ion-button>,
+              <ion-button size="small" color="tertiary" class="studio-button" onClick={() => this.chooseConflict(conflict.id, 'incoming')}>按平板顺序</ion-button>,
+            ]}
+            {(conflict.kind === 'step-delete' || conflict.kind === 'module-delete') && [
+              <ion-button size="small" color="primary" class="studio-button" onClick={() => this.chooseConflict(conflict.id, 'keep')}>保留内容</ion-button>,
+              <ion-button size="small" color="danger" class="studio-button" onClick={() => this.chooseConflict(conflict.id, 'delete')}>确认删除</ion-button>,
+            ]}
+          </footer>
+        )}
+      </article>
+    );
+  }
+
+  private closeMergePanel(): void {
+    this.mergePanelOpen = false;
+  }
+
+  private renderMergeOverlay() {
+    const session = this.mergeSession;
+    if (!session || !this.mergePanelOpen) return null;
+    const { done, total } = this.mergeProgress;
+    const unresolved = this.mergeConflicts;
+    const resolvedCount = session.conflicts.length - unresolved.length;
+    const canFinish = canCompleteMerge(session);
+    const interrupted = session.status === 'interrupted';
+    return (
+      <div class="merge-overlay-backdrop">
+        <section class="merge-overlay" role="dialog" aria-label="离线课程包合并">
+          <header class="merge-overlay-head">
+            <div>
+              <span class="eyebrow">离线课程包合并</span>
+              <h2>{session.importedFileName}</h2>
+              <p>导出于 {this.formatDate(session.pkg.exportedAt)} · 合并开始 {this.formatDate(session.createdAt)}</p>
+            </div>
+            <ion-button fill="clear" color="medium" class="studio-button" onClick={() => this.closeMergePanel()}>收起</ion-button>
+          </header>
+
+          <div class="merge-progress-row">
+            <div class="merge-progress-track"><span style={{ width: `${total ? Math.round((done / total) * 100) : 100}%` }} /></div>
+            <span>{done}/{total} 模块已处理</span>
+            <span class="merge-conflict-count">{resolvedCount}/{session.conflicts.length} 冲突已选择</span>
+          </div>
+
+          {interrupted && session.failedAt && (
+            <div class="merge-interrupted-callout">
+              <div>
+                <strong>合并在模块「{session.failedAt.moduleId}」处中断</strong>
+                <span>{session.failedAt.message} 已处理的模块和待选冲突都已保留，刷新页面也不会丢失。</span>
+              </div>
+              <div class="merge-interrupted-actions">
+                <ion-button size="small" class="studio-button" disabled={this.mergeDriving} onClick={() => this.continueMerge('retry')}>重试该模块</ion-button>
+                <ion-button size="small" fill="outline" class="studio-button" disabled={this.mergeDriving} onClick={() => this.continueMerge('skip')}>跳过（保留原模块）</ion-button>
+              </div>
+            </div>
+          )}
+
+          {this.mergeDriving && <div class="merge-driving-hint">正在逐模块检查点处理，中断后可从当前模块继续……</div>}
+
+          <div class="merge-stats">
+            <div><strong>{session.stats.autoFields}</strong><span>自动并入的改动</span></div>
+            <div><strong>{session.stats.addedSteps}</strong><span>新增步骤</span></div>
+            <div><strong>{session.stats.deletedSteps}</strong><span>删除步骤</span></div>
+            <div><strong>{session.stats.addedModules}</strong><span>新增模块</span></div>
+          </div>
+
+          {session.notices.length > 0 && (
+            <div class="merge-notices">
+              {session.notices.map((notice) => (
+                <div class={`merge-notice notice-${notice.type}`} key={notice.id}>
+                  <span>{notice.type === 'reorder' ? '↕' : notice.type === 'dangling-prerequisite' ? '!' : '⏭'}</span>
+                  {notice.message}
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div class="merge-conflict-list">
+            {session.conflicts.length === 0 && !interrupted && (
+              <div class="merge-all-clear"><strong>没有同一位置的双方改动</strong><p>两侧改动互不重叠，已自动合并，确认后写入工作稿。</p></div>
+            )}
+            {unresolved.map((conflict) => this.renderConflictItem(conflict))}
+            {resolvedCount > 0 && (
+              <details class="merge-resolved-details">
+                <summary>已选择的 {resolvedCount} 处差异（点击查看）</summary>
+                {session.conflicts.filter((conflict) => conflict.resolved).map((conflict) => this.renderConflictItem(conflict))}
+              </details>
+            )}
+          </div>
+
+          <footer class="merge-overlay-foot">
+            <p>{canFinish
+              ? '所有模块已处理、冲突已选择，确认后改动才会写入工作稿。'
+              : interrupted
+                ? '处理中断，重试或跳过该模块后才能并入。'
+                : `还有 ${unresolved.length} 处差异未选择，选完前不能并入，也不能提交复核。`}</p>
+            <div>
+              <ion-button fill="clear" color="medium" class="studio-button" onClick={() => this.cancelMerge()}>放弃合并</ion-button>
+              <ion-button fill="outline" color="medium" class="studio-button" onClick={() => this.closeMergePanel()}>稍后再说（保留进度）</ion-button>
+              <ion-button color="success" class="studio-button" disabled={!canFinish} onClick={() => this.confirmMerge()}>确认并入工作稿</ion-button>
+            </div>
+          </footer>
+        </section>
+      </div>
+    );
   }
 
   private togglePlay(): void {
@@ -554,6 +989,10 @@ export class AppRoot {
                 <ion-button fill="clear" class="studio-button" disabled={this.past.length === 0} onClick={() => this.undo()}>撤销</ion-button>
                 <ion-button fill="clear" class="studio-button" disabled={this.future.length === 0} onClick={() => this.redo()}>重做</ion-button>
                 <ion-button fill="outline" class="studio-button" onClick={() => this.saveDraft()}>保存草稿</ion-button>
+                <ion-button fill="clear" class="studio-button" onClick={() => this.exportOfflinePackage()} disabled={this.project.status === 'frozen' || Boolean(this.mergeSession)}>导出平板包</ion-button>
+                <ion-button fill="clear" class={`studio-button ${this.mergeSession ? 'merge-active-button' : ''}`} onClick={() => this.triggerImport()} disabled={this.project.status === 'frozen'}>
+                  {this.mergeSession ? `合并进行中（${this.mergeConflicts.length} 待选）` : '导入并合并'}
+                </ion-button>
                 {this.project.status === 'review'
                   ? <ion-button color="success" class="studio-button" onClick={() => this.freezeVersion()}>冻结版本</ion-button>
                   : this.project.status === 'changes'
@@ -569,7 +1008,7 @@ export class AppRoot {
             <div class="project-ribbon">
               <div class="project-heading">
                 {this.renderStatusBadge()}
-                <ion-input value={this.project.title} class="project-title-input" onIonInput={(event) => { this.project = { ...this.project, title: event.detail.value ?? '' }; this.persist(); }} />
+                <ion-input disabled={this.project.status === 'frozen' || Boolean(this.mergeSession)} value={this.project.title} class="project-title-input" onIonInput={(event) => { if (this.mergeSession) return; this.project = { ...this.project, title: event.detail.value ?? '' }; this.persist(); }} />
                 <span>{this.project.teacher} · {this.project.audience}</span>
               </div>
               <div class="project-metrics">
@@ -584,6 +1023,15 @@ export class AppRoot {
                 <ion-button fill="clear" class="studio-button" onClick={() => this.addStep('练习')}>＋ 练习步骤</ion-button>
               </div>
             </div>
+
+            {this.mergeSession && (
+              <button class="merge-resume-banner" onClick={() => { this.mergePanelOpen = true; }}>
+                <span class="merge-banner-dot" />
+                <strong>离线包合并{this.mergeSession.status === 'interrupted' ? '已中断' : '进行中'}</strong>
+                <span>{this.mergeProgress.done}/{this.mergeProgress.total} 模块 · {this.mergeConflicts.length} 处差异待选</span>
+                <em>已处理模块和待选冲突已保留{this.mergeSession.status === 'interrupted' ? '，请重试或跳过中断模块' : '，点击继续'} </em>
+              </button>
+            )}
 
             <main class="studio-workspace">
               <aside class="course-panel">
@@ -616,6 +1064,14 @@ export class AppRoot {
               {this.renderPreview()}
             </main>
           </ion-content>
+          {this.renderMergeOverlay()}
+          <input
+            type="file"
+            accept="application/json,.json"
+            class="hidden-file-input"
+            ref={(el) => { this.fileInput = el as HTMLInputElement; }}
+            onChange={(event) => { void this.handlePackageSelected(event); }}
+          />
           <ion-toast isOpen={Boolean(this.toast)} message={this.toast?.message} color={this.toast?.color} duration={3200} onDidDismiss={() => { this.toast = undefined; }} />
         </ion-app>
       </Host>

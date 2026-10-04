@@ -6,18 +6,25 @@
   "module": "dist/index.js",
   "types": "dist/types/components.d.ts",
   "collection": "dist/collection/collection-manifest.json",
-  "files": ["dist/", "loader/"],
+  "files": [
+    "dist/",
+    "loader/"
+  ],
   "type": "module",
   "scripts": {
     "dev": "stencil build --dev --watch --serve --no-open",
     "build": "stencil build --no-open",
-    "test": "stencil test --spec --e2e"
+    "test": "stencil test --spec",
+    "test:e2e": "stencil test --spec --e2e"
   },
   "dependencies": {
     "@ionic/core": "^9.0.5"
   },
   "devDependencies": {
     "@stencil/core": "^4.45.1",
+    "@types/jest": "^27.5.2",
+    "jest": "^27.5.1",
+    "jest-cli": "^27.5.1",
     "typescript": "^5.9.3"
   }
 }
